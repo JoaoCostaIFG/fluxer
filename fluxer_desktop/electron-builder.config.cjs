@@ -53,7 +53,9 @@ const supportedTargetArchs = ['x64', 'arm64'];
 const supportedMacTargetArchs = [...supportedTargetArchs, 'universal'];
 const electronArch = process.env.ELECTRON_ARCH;
 const cliTargetArch = supportedMacTargetArchs.find((arch) => process.argv.includes(`--${arch}`)) || null;
-const targetNativeArch = electronArch || cliTargetArch;
+// Fork: the fork only publishes x64 Windows/Linux artifacts, so an unqualified --win/--linux
+// build defaults to x64 instead of falling back to both architectures.
+const targetNativeArch = electronArch || cliTargetArch || (isLinuxBuild || isWindowsBuild ? 'x64' : null);
 
 if (electronArch && !supportedMacTargetArchs.includes(electronArch)) {
 	throw new Error(`Unsupported ELECTRON_ARCH: ${electronArch}`);
@@ -73,10 +75,16 @@ const targetArchs = electronArch && electronArch !== 'universal' ? [electronArch
 const macTargetArchs = targetNativeArch ? [targetNativeArch] : supportedTargetArchs;
 const winGameCaptureTargetArchs =
 	targetPlatform === 'win32' && targetNativeArch ? [targetNativeArch] : supportedTargetArchs;
+// Fork: Windows ships an assisted NSIS setup plus a portable zip, x64 only. The official
+// unpacked-dir + Velopack pipeline is not used by fork builds.
 const winTargets = [
 	{
-		target: 'dir',
-		arch: targetArchs,
+		target: 'nsis',
+		arch: ['x64'],
+	},
+	{
+		target: 'zip',
+		arch: ['x64'],
 	},
 ];
 const fluxerNativePackages = [
@@ -1650,28 +1658,31 @@ module.exports = {
 		icon: `build_resources/${iconDir}/icon.ico`,
 		target: winTargets,
 	},
+	// Fork: assisted installer for the unsigned NSIS setup. Installs per-user (no UAC), like the
+	// official Velopack setup does.
+	nsis: {
+		oneClick: false,
+		perMachine: false,
+		allowToChangeInstallationDirectory: true,
+		deleteAppDataOnUninstall: false,
+		artifactName: `${artifactProductName}-\${version}-Setup-\${os}-\${arch}.\${ext}`,
+		shortcutName: productName,
+	},
 	portable: {
 		artifactName: `${artifactProductName}-\${version}-portable-\${os}-\${arch}.\${ext}`,
 	},
 	linux: {
 		icon: `build_resources/${iconDir}/1024x1024.png`,
 		category: 'Network;InstantMessaging;Chat;',
+		// Fork: AppImage + deb, x64 only. RPM and tar.gz are dropped from fork releases.
 		target: [
 			{
 				target: 'AppImage',
-				arch: targetArchs,
+				arch: ['x64'],
 			},
 			{
 				target: 'deb',
-				arch: targetArchs,
-			},
-			{
-				target: 'rpm',
-				arch: targetArchs,
-			},
-			{
-				target: 'tar.gz',
-				arch: targetArchs,
+				arch: ['x64'],
 			},
 		],
 		desktop: {

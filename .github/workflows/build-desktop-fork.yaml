@@ -1,0 +1,266 @@
+name: build desktop (fork)
+
+# Fork pipeline: builds the self-hosted desktop app for Windows and Linux and attaches the
+# artifacts to the GitHub release that the in-app updater checks. It reuses the in-repo
+# tools/ci build steps but skips everything tied to the upstream release infrastructure
+# (GitHub App tokens, Azure Trusted Signing, Velopack packaging, macOS, pkgs.fluxer.com).
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Build version (for example 2026.925.1). Empty allocates a UTC CalVer version.'
+        required: false
+        default: ''
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-fork-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_CHANNEL: stable
+
+jobs:
+  meta:
+    name: Resolve build version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          elif [[ -n "${{ inputs.version }}" ]]; then
+            version="${{ inputs.version }}"
+          else
+            version="$(date -u +%Y.%-m%d.%-H%M%S)"
+          fi
+          if ! [[ "$version" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+            echo "Refusing version '$version': use a numeric dotted version such as 2026.925.1 (tag v2026.925.1)." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building fork desktop version $version"
+
+  build:
+    name: Build ${{ matrix.platform }} x64
+    needs: meta
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-22.04
+            electron_arch: x64
+            rust_targets: x86_64-unknown-linux-gnu
+          - platform: windows
+            os: windows-2025
+            electron_arch: x64
+            rust_targets: x86_64-pc-windows-msvc
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      BUILD_VERSION: ${{ needs.meta.outputs.version }}
+      PUBLIC_BUILD_VERSION: ${{ needs.meta.outputs.version }}
+      RELEASE_CHANNEL: stable
+      PUBLIC_RELEASE_CHANNEL: stable
+      ELECTRON_ARCH: ${{ matrix.electron_arch }}
+      DESKTOP_PLATFORM: ${{ matrix.platform }}
+      DESKTOP_ARCH: x64
+      FLUXER_FORK_UPDATE_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.98.1'
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Set up Python (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Ensure python3 command (Windows)
+        if: runner.os == 'Windows'
+        run: >-
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          build-desktop --step ensure_python3_windows
+
+      - name: Shorten Windows paths and pin pnpm store
+        if: runner.os == 'Windows'
+        run: >-
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          build-desktop --step windows_paths
+        env:
+          SUBST_TARGET: ${{ github.workspace }}
+          ARCH: x64
+
+      - name: Set workdir (Unix)
+        if: runner.os != 'Windows'
+        run: >-
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          build-desktop --step set_workdir_unix
+        env:
+          SUBST_TARGET: ${{ github.workspace }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 26
+
+      - name: Set up pnpm
+        run: >-
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          build-desktop --step setup_pnpm
+
+      - name: Resolve pnpm store path (Windows)
+        if: runner.os == 'Windows'
+        run: >-
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          build-desktop --step resolve_pnpm_store_windows
+
+      - name: Resolve pnpm store path (Unix)
+        if: runner.os != 'Windows'
+        run: >-
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          build-desktop --step resolve_pnpm_store_unix
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PNPM_STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Cache cargo build caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tools/ci/target
+            fluxer_desktop/native/**/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: >-
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          build-desktop --step install_linux_deps
+
+      - name: Set up MSVC environment (Windows)
+        if: matrix.platform == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install dependencies
+        working-directory: ${{ env.WORKDIR }}/fluxer_desktop
+        run: >-
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          build-desktop --step install_dependencies
+
+      - name: Update version
+        working-directory: ${{ env.WORKDIR }}/fluxer_desktop
+        run: >-
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          build-desktop --step update_version
+
+      - name: Build Electron main process and native addons
+        working-directory: ${{ env.WORKDIR }}/fluxer_desktop
+        run: >-
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          build-desktop --step build_electron_main
+
+      - name: Build Electron app (Linux)
+        if: matrix.platform == 'linux'
+        working-directory: ${{ env.WORKDIR }}/fluxer_desktop
+        env:
+          USE_SYSTEM_FPM: true
+        run: >-
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          build-desktop --step build_app_linux
+
+      - name: Build Electron app (Windows)
+        if: matrix.platform == 'windows'
+        working-directory: ${{ env.WORKDIR }}/fluxer_desktop
+        run: >-
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          build-desktop --step build_app_windows
+
+      - name: Generate SHA256 checksums
+        working-directory: ${{ env.WORKDIR }}/fluxer_desktop/dist-electron
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for file in *; do
+            [[ -f "$file" && "$file" != *.sha256 ]] || continue
+            sha256sum "$file" | awk '{print $1}' > "$file.sha256"
+            echo "$(cat "$file.sha256")  $file"
+          done
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fluxer-fork-desktop-${{ matrix.platform }}-x64-${{ needs.meta.outputs.version }}
+          path: ${{ env.WORKDIR }}/fluxer_desktop/dist-electron/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  release:
+    name: Publish fork release
+    if: github.ref_type == 'tag' && needs.build.result == 'success'
+    needs:
+      - meta
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          pattern: fluxer-fork-desktop-*
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=()
+          while IFS= read -r -d '' file; do
+            files+=("$file")
+          done < <(find release -type f -print0)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo 'No release artifacts found.' >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Fluxer desktop (fork) $VERSION" \
+            --generate-notes \
+            "${files[@]}"

@@ -26,6 +26,8 @@ import {
 import {
 	buildManualVersionDownloadUrl,
 	DOWNLOAD_PAGE_URL,
+	FORK_RELEASES_API_URL,
+	FORK_UPDATE_REPO,
 	getManualDownloadOptions,
 	getManualDownloadUrl,
 	MANUAL_DESKTOP_FORMATS,
@@ -86,6 +88,12 @@ type UpdaterEvent =
 	  };
 
 const requireModule = createRequire(import.meta.url);
+
+// Fork update mode, baked in at build time by scripts/build.mjs from FLUXER_FORK_UPDATE_REPO:
+// '' (unset) keeps the official upstream behaviour for development and tests, 'github' serves
+// manual update checks from the fork's GitHub releases, 'disabled' never checks for updates.
+// The undefined-env guard keeps vm-hosted tests working.
+const FORK_UPDATES = process.env === undefined ? '' : (process.env.FLUXER_FORK_UPDATES ?? '');
 
 let lastContext: UpdaterContext = 'background';
 type VelopackUpdate = UpdateInfo | VelopackAsset;
@@ -583,6 +591,10 @@ function sendManualUpdateAvailable(
 
 async function checkManualUpdate(context: UpdaterContext, getMainWindow: () => BrowserWindow | null): Promise<void> {
 	send(getMainWindow(), {type: 'checking', context});
+	if (FORK_UPDATES === 'github') {
+		await checkForkGithubRelease(context, getMainWindow);
+		return;
+	}
 	try {
 		const latest = await fetchManualLatest({forceRefresh: context === 'user'});
 		const current = app.getVersion();
@@ -593,6 +605,108 @@ async function checkManualUpdate(context: UpdaterContext, getMainWindow: () => B
 		}
 	} catch (error) {
 		log.warn('Manual update check failed', error);
+		send(getMainWindow(), {type: 'error', context, phase: 'check', message: getErrorMessage(error)});
+	}
+}
+
+const FORK_RELEASE_CACHE_TTL_MS = 5 * 60 * 1000;
+let forkReleaseCache: {at: number; info: ManualLatestInfo} | null = null;
+
+function forkAssetMatchesPlatform(assetName: string): boolean {
+	const lowered = assetName.toLowerCase();
+	if (/(arm64|aarch64)/.test(lowered)) {
+		return false;
+	}
+	if (process.platform === 'win32') {
+		return lowered.endsWith('.exe') || lowered.endsWith('.zip');
+	}
+	if (process.platform === 'linux') {
+		return lowered.endsWith('.appimage') || lowered.endsWith('.deb');
+	}
+	return false;
+}
+
+function forkAssetFormat(assetName: string): ManualDesktopFormat | null {
+	const lowered = assetName.toLowerCase();
+	if (lowered.endsWith('.exe')) return 'setup';
+	if (lowered.endsWith('.zip')) return 'zip';
+	if (lowered.endsWith('.appimage')) return 'appimage';
+	if (lowered.endsWith('.deb')) return 'deb';
+	return null;
+}
+
+function parseForkLatestRelease(payload: unknown): ManualLatestInfo | null {
+	if (!isRecord(payload) || typeof payload.tag_name !== 'string' || !Array.isArray(payload.assets)) {
+		return null;
+	}
+	const version = payload.tag_name.replace(/^v/, '');
+	if (version.length === 0) {
+		return null;
+	}
+	const files: Partial<Record<ManualDesktopFormat, ManualLatestFile>> = {};
+	for (const asset of payload.assets) {
+		if (
+			!isRecord(asset) ||
+			typeof asset.name !== 'string' ||
+			typeof asset.browser_download_url !== 'string' ||
+			!forkAssetMatchesPlatform(asset.name)
+		) {
+			continue;
+		}
+		const format = forkAssetFormat(asset.name);
+		if (format == null || files[format] != null) {
+			continue;
+		}
+		files[format] = {url: asset.browser_download_url, sha256: null};
+	}
+	return {
+		version,
+		pubDate: typeof payload.published_at === 'string' ? payload.published_at : null,
+		files,
+	};
+}
+
+async function fetchForkLatestRelease(options: {forceRefresh?: boolean} = {}): Promise<ManualLatestInfo | null> {
+	const now = Date.now();
+	if (!options.forceRefresh && forkReleaseCache && now - forkReleaseCache.at < FORK_RELEASE_CACHE_TTL_MS) {
+		return forkReleaseCache.info;
+	}
+	const response = await fetch(FORK_RELEASES_API_URL, {
+		cache: 'no-store',
+		headers: {
+			Accept: 'application/vnd.github+json',
+			'X-GitHub-Api-Version': '2022-11-28',
+			'User-Agent': 'fluxer-desktop-fork-updater',
+		},
+	});
+	if (response.status === 404) {
+		log.warn(`Fork update repository has no published release yet: ${FORK_UPDATE_REPO}`);
+		return null;
+	}
+	if (!response.ok) {
+		throw new Error(`Fork latest release request failed: ${response.status}`);
+	}
+	const info = parseForkLatestRelease(await response.json());
+	if (info == null) {
+		throw new Error('Fork latest release response is missing a tag or usable assets');
+	}
+	forkReleaseCache = {at: now, info};
+	return info;
+}
+
+async function checkForkGithubRelease(
+	context: UpdaterContext,
+	getMainWindow: () => BrowserWindow | null,
+): Promise<void> {
+	try {
+		const latest = await fetchForkLatestRelease({forceRefresh: context === 'user'});
+		if (latest == null || compareVersions(latest.version, app.getVersion()) <= 0) {
+			send(getMainWindow(), {type: 'not-available', context});
+			return;
+		}
+		sendManualUpdateAvailable(getMainWindow, context, latest);
+	} catch (error) {
+		log.warn('Fork update check failed', error);
 		send(getMainWindow(), {type: 'error', context, phase: 'check', message: getErrorMessage(error)});
 	}
 }
@@ -803,7 +917,31 @@ function registerManualUpdater(
 	});
 }
 
+function registerDisabledManualUpdater(getMainWindow: () => BrowserWindow | null): void {
+	ipcMain.handle('updater-check', async (_e, context: UpdaterContext) => {
+		lastContext = context;
+		send(getMainWindow(), {type: 'not-available', context});
+	});
+	ipcMain.handle('updater-download', async (_e, context: UpdaterContext) => {
+		lastContext = context;
+		send(getMainWindow(), {type: 'unsupported', context, reason: 'platform'});
+	});
+	ipcMain.handle('updater-install', async () => {
+		throw new Error('In-app updates are disabled in this build.');
+	});
+}
+
 export function registerUpdater(getMainWindow: () => BrowserWindow | null) {
+	if (FORK_UPDATES === 'disabled') {
+		registerDisabledManualUpdater(getMainWindow);
+		return;
+	}
+	if (FORK_UPDATES === 'github') {
+		// Fork builds never self-update: the check compares against the fork's GitHub releases and
+		// always resolves to a manual download, on every platform and package format.
+		registerManualUpdater(getMainWindow, 'platform');
+		return;
+	}
 	if (!app.isPackaged) {
 		registerManualUpdater(getMainWindow, 'unpackaged');
 		return;

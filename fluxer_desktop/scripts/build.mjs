@@ -18,11 +18,17 @@ const isProduction =
 const skipNative = process.env.FLUXER_SKIP_NATIVE === 'true';
 const embeddedBuildVersion = process.env.PUBLIC_BUILD_VERSION || process.env.BUILD_VERSION || '';
 const embeddedReleaseChannel = process.env.PUBLIC_RELEASE_CHANNEL || process.env.RELEASE_CHANNEL || '';
+// Fork update wiring: set FLUXER_FORK_UPDATE_REPO=owner/name at build time to serve "check for
+// updates" from that GitHub repository's releases (manual download only). Without it, update
+// checks are disabled entirely so a fork build can never be replaced by an official release.
+const forkUpdateRepo = (process.env.FLUXER_FORK_UPDATE_REPO ?? '').trim();
 const publicBuildDefines = {
 	'process.env.PUBLIC_BUILD_VERSION': JSON.stringify(embeddedBuildVersion),
 	'process.env.BUILD_VERSION': JSON.stringify(embeddedBuildVersion),
 	'process.env.PUBLIC_RELEASE_CHANNEL': JSON.stringify(embeddedReleaseChannel),
 	'process.env.RELEASE_CHANNEL': JSON.stringify(embeddedReleaseChannel),
+	'process.env.FLUXER_FORK_UPDATES': JSON.stringify(forkUpdateRepo ? 'github' : 'disabled'),
+	'process.env.FLUXER_FORK_UPDATE_REPO': JSON.stringify(forkUpdateRepo),
 };
 const electronExternals = [
 	'electron',
