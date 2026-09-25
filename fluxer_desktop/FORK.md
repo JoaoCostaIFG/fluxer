@@ -12,7 +12,7 @@ builds from this repository. It is maintained on top of upstream `fluxerapp/flux
 | `scripts/build.mjs` | Bakes `FLUXER_FORK_UPDATE_REPO` into the bundle: set to `owner/name` it enables the GitHub-releases check; unset it disables update checks entirely. |
 | `electron-builder.config.cjs` | Windows ships an assisted **NSIS setup + portable zip** (x64); Linux ships **AppImage + deb** (x64). RPM and tar.gz are dropped. An unqualified `--win`/`--linux` build defaults to x64. |
 | `.gitignore` | Ignores `pnpm-store-*/`: the Windows CI step pins the pnpm store inside the checkout, and `pnpm version` refuses to run on a dirty tree. |
-| `.github/workflows/build-desktop-fork.yaml` | CI: builds Windows x64 + Linux x64, attaches artifacts and SHA256 checksums to the GitHub release for a pushed `v*` tag. |
+| `.github/workflows/build-desktop-fork.yaml` | CI: builds Windows x64 + Linux x64, attaches artifacts and SHA256 checksums to the GitHub release for a pushed `v*` tag. Steps run `tools/ci` with `cargo run --target-dir` into runner temp, keeping the workflow-level `fluxer-ci.exe` out of the in-tree `target/` that the nested per-addon `cargo run`s relink — Windows cannot replace a running executable (upstream gets the same separation from its separate `_ci` checkout). |
 
 Everything else is upstream, so rebasing is usually just this diff.
 

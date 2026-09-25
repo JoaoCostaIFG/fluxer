@@ -4,6 +4,14 @@ name: build desktop (fork)
 # artifacts to the GitHub release that the in-app updater checks. It reuses the in-repo
 # tools/ci build steps but skips everything tied to the upstream release infrastructure
 # (GitHub App tokens, Azure Trusted Signing, Velopack packaging, macOS, pkgs.fluxer.com).
+#
+# Every step invokes tools/ci with `cargo run --target-dir` into runner temp. Unlike
+# upstream, which keeps a separate `_ci` checkout, this pipeline has a single checkout,
+# so the workflow-level fluxer-ci.exe must stay out of the in-tree target/ that the
+# nested cargo runs launched by `pnpm build` relink under different RUSTFLAGS (they
+# pick up fluxer_desktop/native/.cargo/config.toml from the addon working
+# directories) - Windows cannot replace a running executable, so sharing the path
+# fails with "Access is denied. (os error 5)".
 on:
   workflow_dispatch:
     inputs:
@@ -88,12 +96,12 @@ jobs:
         if: runner.os == 'Windows'
         # Windows Defender holds a scan lock on freshly executed unsigned build tools
         # (fluxer-ci.exe), which makes cargo's artifact swap fail with "Access is denied
-        # (os error 5)" whenever it relinks target/debug/fluxer-ci.exe. Retrying cannot
-        # recover while every rebuild re-executes the binary first, so keep Defender out
-        # of the build tree instead.
+        # (os error 5)" whenever it relinks the binary again. Keep Defender out of every
+        # directory cargo links fluxer-ci.exe into: the in-tree target/ (relinked by the
+        # nested per-addon cargo runs) and the workflow-level tool's runner-temp target.
         shell: pwsh
         run: |
-          Add-MpPreference -ExclusionPath @('${{ github.workspace }}', 'C:\fcargo') -ExclusionProcess 'fluxer-ci.exe'
+          Add-MpPreference -ExclusionPath @('${{ github.workspace }}', 'C:\fcargo', '${{ runner.temp }}\fluxer-ci-tool') -ExclusionProcess 'fluxer-ci.exe'
           Get-MpPreference | Select-Object -ExpandProperty ExclusionPath
 
       - name: Set up Rust toolchain
@@ -111,13 +119,15 @@ jobs:
       - name: Ensure python3 command (Windows)
         if: runner.os == 'Windows'
         run: >-
-          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml
+          --target-dir ${{ runner.temp }}/fluxer-ci-tool --
           build-desktop --step ensure_python3_windows
 
       - name: Shorten Windows paths and pin pnpm store
         if: runner.os == 'Windows'
         run: >-
-          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml
+          --target-dir ${{ runner.temp }}/fluxer-ci-tool --
           build-desktop --step windows_paths
         env:
           SUBST_TARGET: ${{ github.workspace }}
@@ -126,7 +136,8 @@ jobs:
       - name: Set workdir (Unix)
         if: runner.os != 'Windows'
         run: >-
-          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml
+          --target-dir ${{ runner.temp }}/fluxer-ci-tool --
           build-desktop --step set_workdir_unix
         env:
           SUBST_TARGET: ${{ github.workspace }}
@@ -138,19 +149,22 @@ jobs:
 
       - name: Set up pnpm
         run: >-
-          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml
+          --target-dir ${{ runner.temp }}/fluxer-ci-tool --
           build-desktop --step setup_pnpm
 
       - name: Resolve pnpm store path (Windows)
         if: runner.os == 'Windows'
         run: >-
-          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml
+          --target-dir ${{ runner.temp }}/fluxer-ci-tool --
           build-desktop --step resolve_pnpm_store_windows
 
       - name: Resolve pnpm store path (Unix)
         if: runner.os != 'Windows'
         run: >-
-          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml
+          --target-dir ${{ runner.temp }}/fluxer-ci-tool --
           build-desktop --step resolve_pnpm_store_unix
 
       - name: Cache pnpm store
@@ -164,9 +178,11 @@ jobs:
       - name: Cache cargo build caches
         uses: actions/cache@v6
         with:
-          # The workspace root target/ holds the tools/ci (fluxer-ci) builds; the native
-          # addon inner builds land in each addon's target/ on Linux and in C:\fcargo on
-          # Windows. The v2 key segment restarts the cache after the path correction.
+          # The workspace root target/ holds the fluxer-ci builds relaunched by the nested
+          # cargo runs inside pnpm build (the workflow-level tool builds in runner temp);
+          # the native addon inner builds land in each addon's target/ on Linux and in
+          # C:\fcargo on Windows. The v2 key segment restarts the cache after the path
+          # correction.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
@@ -182,7 +198,8 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: >-
-          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml
+          --target-dir ${{ runner.temp }}/fluxer-ci-tool --
           build-desktop --step install_linux_deps
 
       - name: Set up MSVC environment (Windows)
@@ -194,26 +211,32 @@ jobs:
       - name: Install dependencies
         working-directory: ${{ env.WORKDIR }}/fluxer_desktop
         run: >-
-          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml
+          --target-dir ${{ runner.temp }}/fluxer-ci-tool --
           build-desktop --step install_dependencies
 
       - name: Update version
         working-directory: ${{ env.WORKDIR }}/fluxer_desktop
         run: >-
-          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml
+          --target-dir ${{ runner.temp }}/fluxer-ci-tool --
           build-desktop --step update_version
 
       - name: Build Electron main process and native addons
         working-directory: ${{ env.WORKDIR }}/fluxer_desktop
-        # Windows runners intermittently hold a lock on target/debug/fluxer-ci.exe while cargo
-        # relinks it (Defender scanning the freshly executed binary, or a leftover process), which
-        # fails the link with "Access is denied. (os error 5)". Retry, killing leftover build tools
-        # between attempts, the same transient-failure class upstream retries electron-builder for.
+        # The nested cargo runs this step launches through pnpm build - set_build_channel
+        # and each per-addon build-desktop-native-addon, which relink
+        # target/debug/fluxer-ci.exe under different RUSTFLAGS - used to fail with
+        # "Access is denied. (os error 5)" because the running workflow-level
+        # fluxer-ci.exe shared that path. The runner-temp --target-dir invocations keep
+        # them apart; retry, killing leftover build tools between attempts, for the
+        # remaining transient lock class (Defender scan locks on freshly executed
+        # binaries), the same class upstream retries electron-builder for.
         shell: bash
         run: |
           set -uo pipefail
           for attempt in 1 2 3; do
-            if cargo run --locked --quiet --manifest-path "${{ github.workspace }}/tools/ci/Cargo.toml" -- build-desktop --step build_electron_main; then
+            if cargo run --locked --quiet --manifest-path "${{ github.workspace }}/tools/ci/Cargo.toml" --target-dir "${{ runner.temp }}/fluxer-ci-tool" -- build-desktop --step build_electron_main; then
               exit 0
             fi
             echo "::warning::Build attempt ${attempt}/3 failed; killing leftover build tools and retrying in 15s."
@@ -231,14 +254,16 @@ jobs:
         env:
           USE_SYSTEM_FPM: true
         run: >-
-          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml
+          --target-dir ${{ runner.temp }}/fluxer-ci-tool --
           build-desktop --step build_app_linux
 
       - name: Build Electron app (Windows)
         if: matrix.platform == 'windows'
         working-directory: ${{ env.WORKDIR }}/fluxer_desktop
         run: >-
-          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
+          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml
+          --target-dir ${{ runner.temp }}/fluxer-ci-tool --
           build-desktop --step build_app_windows
 
       - name: Generate SHA256 checksums
