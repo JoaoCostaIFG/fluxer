@@ -82,7 +82,7 @@ jobs:
       FLUXER_FORK_UPDATE_REPO: ${{ github.repository }}
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -92,7 +92,7 @@ jobs:
 
       - name: Set up Python (Windows)
         if: runner.os == 'Windows'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.14'
 
@@ -120,7 +120,7 @@ jobs:
           SUBST_TARGET: ${{ github.workspace }}
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 26
 
@@ -142,7 +142,7 @@ jobs:
           build-desktop --step resolve_pnpm_store_unix
 
       - name: Cache pnpm store
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ env.PNPM_STORE_PATH }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('pnpm-lock.yaml') }}
@@ -150,7 +150,7 @@ jobs:
             ${{ runner.os }}-pnpm-store-
 
       - name: Cache cargo build caches
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -171,9 +171,9 @@ jobs:
 
       - name: Set up MSVC environment (Windows)
         if: matrix.platform == 'windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: TheMrMilchmann/setup-msvc-dev@v4.1.0
         with:
-          arch: x64
+          arch: amd64
 
       - name: Install dependencies
         working-directory: ${{ env.WORKDIR }}/fluxer_desktop
@@ -189,9 +189,25 @@ jobs:
 
       - name: Build Electron main process and native addons
         working-directory: ${{ env.WORKDIR }}/fluxer_desktop
-        run: >-
-          cargo run --locked --quiet --manifest-path ${{ github.workspace }}/tools/ci/Cargo.toml --
-          build-desktop --step build_electron_main
+        # Windows runners intermittently hold a lock on target/debug/fluxer-ci.exe while cargo
+        # relinks it (Defender scanning the freshly executed binary, or a leftover process), which
+        # fails the link with "Access is denied. (os error 5)". Retry, killing leftover build tools
+        # between attempts, the same transient-failure class upstream retries electron-builder for.
+        shell: bash
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            if cargo run --locked --quiet --manifest-path "${{ github.workspace }}/tools/ci/Cargo.toml" -- build-desktop --step build_electron_main; then
+              exit 0
+            fi
+            echo "::warning::Build attempt ${attempt}/3 failed; killing leftover build tools and retrying in 15s."
+            if command -v taskkill >/dev/null 2>&1; then
+              taskkill //F //IM fluxer-ci.exe 2>/dev/null || true
+            fi
+            sleep 15
+          done
+          echo "::error::Building the Electron main process and native addons failed after 3 attempts."
+          exit 1
 
       - name: Build Electron app (Linux)
         if: matrix.platform == 'linux'
@@ -222,7 +238,7 @@ jobs:
           done
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fluxer-fork-desktop-${{ matrix.platform }}-x64-${{ needs.meta.outputs.version }}
           path: ${{ env.WORKDIR }}/fluxer_desktop/dist-electron/*
@@ -240,7 +256,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release
           pattern: fluxer-fork-desktop-*
