@@ -84,6 +84,18 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v7
 
+      - name: Exclude build tree from Windows Defender (Windows)
+        if: runner.os == 'Windows'
+        # Windows Defender holds a scan lock on freshly executed unsigned build tools
+        # (fluxer-ci.exe), which makes cargo's artifact swap fail with "Access is denied
+        # (os error 5)" whenever it relinks target/debug/fluxer-ci.exe. Retrying cannot
+        # recover while every rebuild re-executes the binary first, so keep Defender out
+        # of the build tree instead.
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath @('${{ github.workspace }}', 'C:\fcargo') -ExclusionProcess 'fluxer-ci.exe'
+          Get-MpPreference | Select-Object -ExpandProperty ExclusionPath
+
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -152,14 +164,18 @@ jobs:
       - name: Cache cargo build caches
         uses: actions/cache@v6
         with:
+          # The workspace root target/ holds the tools/ci (fluxer-ci) builds; the native
+          # addon inner builds land in each addon's target/ on Linux and in C:\fcargo on
+          # Windows. The v2 key segment restarts the cache after the path correction.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            tools/ci/target
+            target
             fluxer_desktop/native/**/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+            C:\fcargo
+          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-v2-
 
       - name: Install Linux dependencies
         if: matrix.platform == 'linux'
