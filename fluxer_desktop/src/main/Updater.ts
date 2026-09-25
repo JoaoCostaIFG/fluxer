@@ -15,6 +15,17 @@ import {
 	sweepAbandonedAppImageUpdates,
 } from '@electron/main/AppImageUpdate';
 import {destroyDesktopTray} from '@electron/main/DesktopTray';
+import {
+	downloadForkSetupFile,
+	ForkSetupChecksumError,
+	type ForkSetupDownloadProgress,
+	fetchForkSetupChecksum,
+	findVerifiedForkSetupFile,
+	getForkSetupFileName,
+	getForkUpdatesDirectory,
+	launchForkSetupInstaller,
+	removeOtherForkSetupFiles,
+} from '@electron/main/ForkWindowsUpdate';
 import {isFlatpakRuntime} from '@electron/main/LinuxSandbox';
 import {relaunchAndExit} from '@electron/main/Troubleshooting';
 import {
@@ -105,6 +116,13 @@ let velopackInstallStarted = false;
 let pendingAppImageUpdate: PendingAppImageUpdate | null = null;
 let appImageUpdatePromise: Promise<void> | null = null;
 let appImageInstallStarted = false;
+// Fork: Windows self-update state. The NSIS setup asset for one version at a time is
+// downloaded into the user data directory and kept across restarts, so a downloaded
+// update that was never installed is offered again without re-downloading.
+type PendingForkSetupUpdate = {version: string; setupPath: string; sha256: string};
+let pendingForkSetup: PendingForkSetupUpdate | null = null;
+let forkSetupCheckPromise: Promise<void> | null = null;
+let forkSetupInstallStarted = false;
 
 const UPDATE_DOWNLOAD_MAX_ATTEMPTS = 5;
 const UPDATE_DOWNLOAD_RETRY_BASE_DELAY_MS = 3000;
@@ -657,7 +675,13 @@ function parseForkLatestRelease(payload: unknown): ManualLatestInfo | null {
 		if (format == null || files[format] != null) {
 			continue;
 		}
-		files[format] = {url: asset.browser_download_url, sha256: null};
+		// Fork: the GitHub API reports each asset's byte size; the Windows self-update flow
+		// uses it for the download progress total.
+		files[format] = {
+			url: asset.browser_download_url,
+			sha256: null,
+			size: typeof asset.size === 'number' && Number.isFinite(asset.size) ? asset.size : null,
+		};
 	}
 	return {
 		version,
@@ -709,6 +733,249 @@ async function checkForkGithubRelease(
 		log.warn('Fork update check failed', error);
 		send(getMainWindow(), {type: 'error', context, phase: 'check', message: getErrorMessage(error)});
 	}
+}
+
+function resolveFailedForkSetupInstall(): VelopackApplyAttempt | null {
+	const attempt = readVelopackApplyAttempt();
+	if (!attempt) {
+		return null;
+	}
+	if (compareVersions(app.getVersion(), attempt.version) >= 0) {
+		clearVelopackApplyAttempt();
+		return null;
+	}
+	return attempt;
+}
+
+function createForkSetupProgressReporter(
+	context: UpdaterContext,
+	getMainWindow: () => BrowserWindow | null,
+	fallbackTotal: number,
+): (progress: ForkSetupDownloadProgress) => void {
+	let lastSampleAt = Date.now();
+	let lastSampleTransferred = 0;
+	let smoothedBytesPerSecond = 0;
+	return ({transferred, total: reportedTotal}) => {
+		const total = reportedTotal > 0 ? reportedTotal : fallbackTotal;
+		const now = Date.now();
+		const dtMs = now - lastSampleAt;
+		const complete = total > 0 && transferred >= total;
+		if (dtMs < UPDATE_PROGRESS_SAMPLE_INTERVAL_MS && !complete) {
+			return;
+		}
+		if (dtMs > 0 && transferred >= lastSampleTransferred) {
+			const instant = ((transferred - lastSampleTransferred) * 1000) / dtMs;
+			smoothedBytesPerSecond = smoothedBytesPerSecond === 0 ? instant : smoothedBytesPerSecond * 0.7 + instant * 0.3;
+		}
+		lastSampleAt = now;
+		lastSampleTransferred = transferred;
+		send(getMainWindow(), {
+			type: 'progress',
+			context,
+			percent: total > 0 ? Math.min(100, (transferred / total) * 100) : 0,
+			transferred,
+			total,
+			bytesPerSecond: Math.round(smoothedBytesPerSecond),
+		});
+	};
+}
+
+async function checkForkWindowsUpdate(
+	context: UpdaterContext,
+	getMainWindow: () => BrowserWindow | null,
+): Promise<void> {
+	if (forkSetupCheckPromise) {
+		return forkSetupCheckPromise;
+	}
+	forkSetupCheckPromise = (async () => {
+		send(getMainWindow(), {type: 'checking', context});
+		const failedInstall = resolveFailedForkSetupInstall();
+		if (failedInstall) {
+			log.error('A fork setup install was started but never applied; offering the installer instead.', failedInstall);
+			send(getMainWindow(), {
+				type: 'error',
+				context,
+				phase: 'install',
+				message: `Fluxer could not finish installing version ${failedInstall.version}.`,
+			});
+			try {
+				const latest = await fetchForkLatestRelease({forceRefresh: context === 'user'});
+				if (latest) {
+					sendManualUpdateAvailable(getMainWindow, context, latest);
+				}
+			} catch (error) {
+				log.warn('Failed to resolve the fork installer download after a failed install', error);
+			}
+			return;
+		}
+		let latest: ManualLatestInfo | null;
+		try {
+			latest = await fetchForkLatestRelease({forceRefresh: context === 'user'});
+		} catch (error) {
+			log.warn('Fork update check failed', error);
+			send(getMainWindow(), {type: 'error', context, phase: 'check', message: getErrorMessage(error)});
+			return;
+		}
+		if (latest == null || compareVersions(latest.version, app.getVersion()) <= 0) {
+			pendingForkSetup = null;
+			removeOtherForkSetupFiles(getForkUpdatesDirectory(app.getPath('userData')), '');
+			send(getMainWindow(), {type: 'not-available', context});
+			return;
+		}
+		const setup = latest.files.setup;
+		if (!setup?.url) {
+			log.info('Fork release has no Windows setup asset, so the manual download is offered instead.', {
+				version: latest.version,
+			});
+			sendManualUpdateAvailable(getMainWindow, context, latest);
+			return;
+		}
+		if (pendingForkSetup && compareVersions(latest.version, pendingForkSetup.version) <= 0) {
+			send(getMainWindow(), {type: 'downloaded', context, version: pendingForkSetup.version});
+			return;
+		}
+		const updatesDirectory = getForkUpdatesDirectory(app.getPath('userData'));
+		const fileName = getForkSetupFileName(setup.url);
+		let expectedSha256: string | null = null;
+		try {
+			expectedSha256 = await fetchForkSetupChecksum(`${setup.url}.sha256`);
+		} catch (error) {
+			log.warn('Fork setup checksum request failed', error);
+		}
+		if (!expectedSha256) {
+			log.warn(
+				`Fork release does not publish a usable ${fileName}.sha256 checksum, so the manual download is offered instead.`,
+			);
+			sendManualUpdateAvailable(getMainWindow, context, latest);
+			return;
+		}
+		send(getMainWindow(), {
+			type: 'available',
+			context,
+			version: latest.version,
+			downloadSize: setup.size ?? null,
+			downloadStarted: true,
+		});
+		const existingSetupPath = await findVerifiedForkSetupFile(updatesDirectory, fileName, expectedSha256);
+		if (existingSetupPath) {
+			pendingForkSetup = {version: latest.version, setupPath: existingSetupPath, sha256: expectedSha256};
+			removeOtherForkSetupFiles(updatesDirectory, fileName);
+			send(getMainWindow(), {type: 'downloaded', context, version: latest.version});
+			return;
+		}
+		await downloadForkSetupUpdate(context, getMainWindow, {
+			updatesDirectory,
+			fileName,
+			setupUrl: setup.url,
+			version: latest.version,
+			expectedSha256,
+			size: setup.size ?? null,
+		});
+	})().finally(() => {
+		forkSetupCheckPromise = null;
+	});
+	return forkSetupCheckPromise;
+}
+
+async function downloadForkSetupUpdate(
+	context: UpdaterContext,
+	getMainWindow: () => BrowserWindow | null,
+	plan: {
+		updatesDirectory: string;
+		fileName: string;
+		setupUrl: string;
+		version: string;
+		expectedSha256: string;
+		size: number | null;
+	},
+): Promise<void> {
+	let lastError: unknown;
+	for (let attempt = 1; attempt <= UPDATE_DOWNLOAD_MAX_ATTEMPTS; attempt += 1) {
+		const onProgress = createForkSetupProgressReporter(context, getMainWindow, plan.size ?? 0);
+		try {
+			const setupPath = await downloadForkSetupFile({
+				updatesDirectory: plan.updatesDirectory,
+				fileName: plan.fileName,
+				setupUrl: plan.setupUrl,
+				expectedSha256: plan.expectedSha256,
+				onProgress,
+			});
+			pendingForkSetup = {version: plan.version, setupPath, sha256: plan.expectedSha256};
+			removeOtherForkSetupFiles(plan.updatesDirectory, plan.fileName);
+			send(getMainWindow(), {type: 'downloaded', context, version: plan.version});
+			return;
+		} catch (error) {
+			lastError = error;
+			if (error instanceof ForkSetupChecksumError || attempt >= UPDATE_DOWNLOAD_MAX_ATTEMPTS) {
+				break;
+			}
+			const delay = backoffDelay(attempt);
+			const reason = getErrorMessage(error);
+			const waitSeconds = Math.round(delay / 1000);
+			log.warn(
+				`Fork setup download attempt ${attempt}/${UPDATE_DOWNLOAD_MAX_ATTEMPTS} failed (${reason}); retrying in ${waitSeconds}s`,
+			);
+			await sleep(delay);
+		}
+	}
+	log.error('Fork setup download failed after retries', lastError);
+	send(getMainWindow(), {type: 'error', context, phase: 'download', message: getErrorMessage(lastError)});
+	try {
+		const latest = await fetchForkLatestRelease();
+		if (latest) {
+			sendManualUpdateAvailable(getMainWindow, context, latest);
+		}
+	} catch (error) {
+		log.warn('Failed to resolve the fork installer download after a failed download', error);
+	}
+}
+
+function installForkSetupUpdate(getMainWindow: () => BrowserWindow | null): void {
+	if (forkSetupInstallStarted) {
+		log.warn('Fork setup install already in progress; ignoring duplicate request.');
+		return;
+	}
+	const pending = pendingForkSetup;
+	if (!pending) {
+		throw new Error('No fork update is ready to install.');
+	}
+	if (resolveFailedForkSetupInstall()) {
+		throw new Error('The last fork update could not be installed. Download the installer to update.');
+	}
+	recordVelopackApplyAttempt(pending.version);
+	forkSetupInstallStarted = true;
+	try {
+		launchForkSetupInstaller(pending.setupPath);
+	} catch (error) {
+		clearVelopackApplyAttempt();
+		forkSetupInstallStarted = false;
+		log.error('Failed to launch the fork setup installer', error);
+		send(getMainWindow(), {
+			type: 'error',
+			context: lastContext,
+			phase: 'install',
+			message: getErrorMessage(error),
+		});
+		return;
+	}
+	log.info(`Reinstalling ${pending.version} from ${pending.setupPath}; the installer relaunches the app.`);
+	setQuitting(true);
+	destroyDesktopTray();
+	setImmediate(() => app.exit(0));
+}
+
+function registerForkWindowsUpdater(getMainWindow: () => BrowserWindow | null): void {
+	ipcMain.handle('updater-check', async (_e, context: UpdaterContext) => {
+		lastContext = context;
+		await checkForkWindowsUpdate(context, getMainWindow);
+	});
+	ipcMain.handle('updater-download', async (_e, context: UpdaterContext) => {
+		lastContext = context;
+		await checkForkWindowsUpdate(context, getMainWindow);
+	});
+	ipcMain.handle('updater-install', () => {
+		installForkSetupUpdate(getMainWindow);
+	});
 }
 
 async function downloadAppImageUpdate(
@@ -937,8 +1204,14 @@ export function registerUpdater(getMainWindow: () => BrowserWindow | null) {
 		return;
 	}
 	if (FORK_UPDATES === 'github') {
-		// Fork builds never self-update: the check compares against the fork's GitHub releases and
-		// always resolves to a manual download, on every platform and package format.
+		// Fork builds never reach the official feed. On Windows the fork self-updates from its
+		// GitHub releases: the check downloads the NSIS setup asset in-app and the restart
+		// prompt reinstalls it silently. Every other platform and package format (portable
+		// zip, unpackaged, non-Windows) keeps the manual download flow.
+		if (process.platform === 'win32' && app.isPackaged && !isPortableMode()) {
+			registerForkWindowsUpdater(getMainWindow);
+			return;
+		}
 		registerManualUpdater(getMainWindow, 'platform');
 		return;
 	}

@@ -31,6 +31,9 @@ function transform(name) {
 
 const appImageUpdateSource = transform('AppImageUpdate.ts');
 const updaterDownloadsSource = transform('UpdaterDownloads.ts');
+// Fork: Updater.ts imports the fork's Windows self-update module; load it so the upstream
+// harness can resolve the specifier the same way the bundler does.
+const forkWindowsUpdateSource = transform('ForkWindowsUpdate.ts');
 const updaterSource = transform('Updater.ts');
 const updaterPlatformUtilsSource = transform('../../../fluxer_app/src/features/app/utils/UpdaterPlatformUtils.ts');
 
@@ -222,6 +225,13 @@ function loadUpdater({
 	sandbox.__filename = updaterDownloadsSource.path;
 	vm.runInContext(updaterDownloadsSource.code, context, {filename: updaterDownloadsSource.path});
 	stubs['@electron/main/UpdaterDownloads'] = updaterDownloadsModule.exports;
+
+	const forkWindowsUpdateModule = {exports: {}};
+	sandbox.module = forkWindowsUpdateModule;
+	sandbox.exports = forkWindowsUpdateModule.exports;
+	sandbox.__filename = forkWindowsUpdateSource.path;
+	vm.runInContext(forkWindowsUpdateSource.code, context, {filename: forkWindowsUpdateSource.path});
+	stubs['@electron/main/ForkWindowsUpdate'] = forkWindowsUpdateModule.exports;
 
 	sandbox.module = module;
 	sandbox.exports = module.exports;

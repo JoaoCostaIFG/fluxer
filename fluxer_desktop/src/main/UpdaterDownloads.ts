@@ -40,7 +40,7 @@ export const DOWNLOAD_PAGE_URL =
 export const MANUAL_DESKTOP_FORMATS = ['setup', 'dmg', 'zip', 'appimage', 'deb', 'rpm', 'tar_gz'] as const;
 
 export type ManualDesktopFormat = (typeof MANUAL_DESKTOP_FORMATS)[number];
-export type ManualLatestFile = {url: string; sha256: string | null};
+export type ManualLatestFile = {url: string; sha256: string | null; size?: number | null};
 type LinuxManualDesktopFormat = Extract<ManualDesktopFormat, 'appimage' | 'deb' | 'rpm' | 'tar_gz'>;
 
 export type ManualLatestInfo = {
