@@ -281,8 +281,20 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
+          # Only the distributables and their checksum sidecars: dist-electron also holds
+          # electron-builder's unpacked app directory (win-unpacked/, linux-unpacked/) and
+          # builder-debug.yml, whose files are not uniquely named across the platform
+          # artifacts and must never reach the release upload.
           name: fluxer-fork-desktop-${{ matrix.platform }}-x64-${{ needs.meta.outputs.version }}
-          path: ${{ env.WORKDIR }}/fluxer_desktop/dist-electron/*
+          path: |
+            ${{ env.WORKDIR }}/fluxer_desktop/dist-electron/*.exe
+            ${{ env.WORKDIR }}/fluxer_desktop/dist-electron/*.zip
+            ${{ env.WORKDIR }}/fluxer_desktop/dist-electron/*.AppImage
+            ${{ env.WORKDIR }}/fluxer_desktop/dist-electron/*.deb
+            ${{ env.WORKDIR }}/fluxer_desktop/dist-electron/*.exe.sha256
+            ${{ env.WORKDIR }}/fluxer_desktop/dist-electron/*.zip.sha256
+            ${{ env.WORKDIR }}/fluxer_desktop/dist-electron/*.AppImage.sha256
+            ${{ env.WORKDIR }}/fluxer_desktop/dist-electron/*.deb.sha256
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -309,15 +321,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # electron-builder drops builder-debug.yml into both platforms' output and the
-          # checksum step adds a .sha256 sidecar next to it; skip those files, because
-          # release assets must have unique names across the platform artifacts.
           files=()
           while IFS= read -r -d '' file; do
             files+=("$file")
-          done < <(find release -type f ! -name 'builder-debug.yml*' -print0)
+          done < <(find release -type f -print0)
           if [[ ${#files[@]} -eq 0 ]]; then
             echo 'No release artifacts found.' >&2
+            exit 1
+          fi
+          # GitHub rejects duplicate asset names with a mid-upload 422 that rolls back the
+          # whole release, so fail fast naming the offenders instead.
+          names=()
+          for file in "${files[@]}"; do
+            names+=("$(basename "$file")")
+          done
+          mapfile -d '' duplicate_names < <(printf '%s\0' "${names[@]}" | sort -z | uniq -d -z)
+          if (( ${#duplicate_names[@]} > 0 )); then
+            echo "::error::Duplicate release asset names: ${duplicate_names[*]}" >&2
             exit 1
           fi
           # The release job never checks out the repository, so gh cannot resolve it from
