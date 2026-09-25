@@ -19,8 +19,7 @@ const INSTALLER_URL =
 	'https://github.com/example/fluxer/releases/download/v2026.926.1/Fluxer-2026.926.1-Setup-win32-x64.exe';
 const APPIMAGE_URL =
 	'https://github.com/example/fluxer/releases/download/v2026.926.1/Fluxer-2026.926.1-linux-x64.AppImage';
-const DEB_URL =
-	'https://github.com/example/fluxer/releases/download/v2026.926.1/Fluxer-2026.926.1-linux-amd64.deb';
+const DEB_URL = 'https://github.com/example/fluxer/releases/download/v2026.926.1/Fluxer-2026.926.1-linux-amd64.deb';
 const ARM_APPIMAGE_URL =
 	'https://github.com/example/fluxer/releases/download/v2026.926.1/Fluxer-2026.926.1-linux-arm64.AppImage';
 
