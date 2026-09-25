@@ -11,6 +11,7 @@ builds from this repository. It is maintained on top of upstream `fluxerapp/flux
 | `src/main/UpdaterDownloads.ts` + `src/main/Updater.ts` | Update checks read this repository's GitHub releases instead of `pkgs.fluxer.com`. Updates are always **manual downloads**; Velopack auto-install (Windows) and AppImage self-update never run, so an official release can never replace a fork install. |
 | `scripts/build.mjs` | Bakes `FLUXER_FORK_UPDATE_REPO` into the bundle: set to `owner/name` it enables the GitHub-releases check; unset it disables update checks entirely. |
 | `electron-builder.config.cjs` | Windows ships an assisted **NSIS setup + portable zip** (x64); Linux ships **AppImage + deb** (x64). RPM and tar.gz are dropped. An unqualified `--win`/`--linux` build defaults to x64. |
+| `.gitignore` | Ignores `pnpm-store-*/`: the Windows CI step pins the pnpm store inside the checkout, and `pnpm version` refuses to run on a dirty tree. |
 | `.github/workflows/build-desktop-fork.yaml` | CI: builds Windows x64 + Linux x64, attaches artifacts and SHA256 checksums to the GitHub release for a pushed `v*` tag. |
 
 Everything else is upstream, so rebasing is usually just this diff.
@@ -42,7 +43,7 @@ automatically from the job environment — no hardcoding to keep in sync.
 
 ## Rebuilding on a new upstream release
 
-The fork touches five files. In practice:
+The fork touches six files. In practice:
 
 ```bash
 git fetch upstream
@@ -53,6 +54,7 @@ git rebase upstream/main        # or merge
 #   fluxer_desktop/src/main/Updater.ts
 #   fluxer_desktop/scripts/build.mjs
 #   fluxer_desktop/electron-builder.config.cjs
+#   .gitignore
 git push origin main --force-with-lease
 ```
 

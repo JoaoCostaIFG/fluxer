@@ -11,6 +11,7 @@
 /.fluxer/
 /.pnpm-store/
 /.vscode/
+/pnpm-store-*/
 
 **/*.css.d.ts
 **/*.tsbuildinfo
