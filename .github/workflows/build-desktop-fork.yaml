@@ -309,10 +309,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # electron-builder drops builder-debug.yml into both platforms' output and the
+          # checksum step adds a .sha256 sidecar next to it; skip those files, because
+          # release assets must have unique names across the platform artifacts.
           files=()
           while IFS= read -r -d '' file; do
             files+=("$file")
-          done < <(find release -type f -print0)
+          done < <(find release -type f ! -name 'builder-debug.yml*' -print0)
           if [[ ${#files[@]} -eq 0 ]]; then
             echo 'No release artifacts found.' >&2
             exit 1
