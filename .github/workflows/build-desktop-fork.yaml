@@ -317,7 +317,10 @@ jobs:
             echo 'No release artifacts found.' >&2
             exit 1
           fi
+          # The release job never checks out the repository, so gh cannot resolve it from
+          # git; pass the repository explicitly.
           gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
             --title "Fluxer desktop (fork) $VERSION" \
             --generate-notes \
             "${files[@]}"
